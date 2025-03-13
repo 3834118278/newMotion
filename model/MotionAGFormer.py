@@ -10,6 +10,92 @@ from model.modules.mlp import MLP
 from model.modules.tcn import MultiScaleTCN
 
 
+class CrossModuleInteraction(nn.Module):
+    """
+    实现多个模块之间的信息交互
+    使用注意力机制来在不同模块的特征之间共享信息
+    """
+    def __init__(self, dim, num_modules=4, heads=1, qkv_bias=True, qk_scale=None, attn_drop=0.1):
+        super().__init__()
+        self.dim = dim
+        self.num_modules = num_modules
+        self.heads = heads
+        self.head_dim = dim // heads
+        self.scale = qk_scale or self.head_dim ** -0.5
+        
+        # 为每个模块创建特征投影
+        self.q_projs = nn.ModuleList([
+            nn.Linear(dim, dim, bias=qkv_bias) for _ in range(num_modules)
+        ])
+        self.k_projs = nn.ModuleList([
+            nn.Linear(dim, dim, bias=qkv_bias) for _ in range(num_modules)
+        ])
+        self.v_projs = nn.ModuleList([
+            nn.Linear(dim, dim, bias=qkv_bias) for _ in range(num_modules)
+        ])
+        
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        
+        # 初始化参数为较小的值，以便模块交互初始较弱
+        self._init_weights()
+    
+    def _init_weights(self):
+        """初始化权重为较小值，使交互最开始比较弱"""
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, std=0.01)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+    
+    def forward(self, module_features):
+        """
+        参数:
+            module_features: 列表，包含每个模块的特征 [B, T, J, C]
+        返回:
+            交互后的特征列表
+        """
+        B, T, J, C = module_features[0].shape
+        
+        # 提取 query, key, value
+        queries = [self.q_projs[i](feat) for i, feat in enumerate(module_features)]
+        keys = [self.k_projs[i](feat) for i, feat in enumerate(module_features)]
+        values = [self.v_projs[i](feat) for i, feat in enumerate(module_features)]
+        
+        # 重塑形状以便计算注意力
+        queries = [q.reshape(B, T*J, self.heads, self.head_dim).transpose(1, 2) for q in queries]  # B, H, T*J, D/H
+        keys = [k.reshape(B, T*J, self.heads, self.head_dim).transpose(1, 2) for k in keys]
+        values = [v.reshape(B, T*J, self.heads, self.head_dim).transpose(1, 2) for v in values]
+        
+        output_features = []
+        
+        # 为每个模块计算交互
+        for i in range(self.num_modules):
+            q = queries[i]  # B, H, T*J, D/H
+            
+            # 计算与所有其他模块的注意力
+            attn_outputs = []
+            for j in range(self.num_modules):
+                k, v = keys[j], values[j]
+                
+                # 计算注意力分数
+                attn = (q @ k.transpose(-2, -1)) * self.scale  # B, H, T*J, T*J
+                attn = attn.softmax(dim=-1)
+                attn = self.attn_drop(attn)
+                
+                # 应用注意力获取上下文
+                out = (attn @ v).transpose(1, 2)  # B, T*J, H, D/H
+                out = out.reshape(B, T, J, C)
+                attn_outputs.append(out)
+            
+            # 合并所有模块的交互结果（简单相加或平均）
+            combined = torch.stack(attn_outputs, dim=0).sum(dim=0)
+            # 残差连接: 添加原始特征
+            output_features.append(module_features[i] + combined * 0.1)  # 添加小系数控制交互强度
+        
+        return output_features
+    
+
 class AGFormerBlock(nn.Module):
     """
     Implementation of AGFormer block.
@@ -73,10 +159,12 @@ class MotionAGFormerBlock(nn.Module):
     def __init__(self, dim, mlp_ratio=4., act_layer=nn.GELU, attn_drop=0., drop=0., drop_path=0.,
                  num_heads=8, use_layer_scale=True, qkv_bias=False, qk_scale=None, layer_scale_init_value=1e-5,
                  use_adaptive_fusion=True, hierarchical=False, use_temporal_similarity=True,
-                 temporal_connection_len=1, use_tcn=False, graph_only=False, neighbour_num=4, n_frames=243):
+                 temporal_connection_len=1, use_tcn=False, graph_only=False, neighbour_num=4, n_frames=243,
+                enable_module_interaction=True):
         super().__init__()
         self.hierarchical = hierarchical
         dim = dim // 2 if hierarchical else dim
+        self.enable_module_interaction = enable_module_interaction
 
         # ST Attention branch
         self.att_spatial = AGFormerBlock(dim, mlp_ratio, act_layer, attn_drop, drop, drop_path, num_heads, qkv_bias,
@@ -124,6 +212,11 @@ class MotionAGFormerBlock(nn.Module):
                                                 neighbour_num=neighbour_num,
                                                 n_frames=n_frames)
 
+        # 添加模块间交互层
+        if enable_module_interaction:
+            self.module_interaction = CrossModuleInteraction(dim=dim, num_modules=4, 
+                                                            heads=2, qkv_bias=True, attn_drop=0.1)
+
         self.use_adaptive_fusion = use_adaptive_fusion
         if self.use_adaptive_fusion:
             self.fusion = nn.Linear(dim * 2, 2)
@@ -141,21 +234,50 @@ class MotionAGFormerBlock(nn.Module):
             B, T, J, C = x.shape
             x_attn, x_graph = x[..., :C // 2], x[..., C // 2:]
 
-            x_attn = self.att_temporal(self.att_spatial(x_attn))
-            x_graph = self.graph_temporal(self.graph_spatial(x_graph + x_attn))
-        else:
-            x_attn = self.att_temporal(self.att_spatial(x))
-            x_graph = self.graph_temporal(self.graph_spatial(x))
-
-        if self.hierarchical:
+            x_att_s = self.att_spatial(x_attn)
+            x_att_t = self.att_temporal(x_att_s)
+            
+            x_graph_s = self.graph_spatial(x_graph + x_attn)
+            x_graph_t = self.graph_temporal(x_graph_s)
+            
+            if self.enable_module_interaction:
+                module_features = [x_att_s, x_att_t, x_graph_s, x_graph_t]
+                [x_att_s, x_att_t, x_graph_s, x_graph_t] = self.module_interaction(module_features)
+                
+            x_attn = x_att_t
+            x_graph = x_graph_t
             x = torch.cat((x_attn, x_graph), dim=-1)
-        elif self.use_adaptive_fusion:
-            alpha = torch.cat((x_attn, x_graph), dim=-1)
-            alpha = self.fusion(alpha)
-            alpha = alpha.softmax(dim=-1)
-            x = x_attn * alpha[..., 0:1] + x_graph * alpha[..., 1:2]
+
         else:
-            x = (x_attn + x_graph) * 0.5
+            # 第一阶段处理
+            x_att_s = self.att_spatial(x)
+            x_graph_s = self.graph_spatial(x)
+            
+            # 如果启用模块交互，在时间处理前先执行
+            if self.enable_module_interaction:
+                # 创建一个临时的 x_att_t 和 x_graph_t，以便进行四个模块的交互
+                x_att_t_tmp = self.att_temporal(x_att_s)
+                x_graph_t_tmp = self.graph_temporal(x_graph_s)
+                
+                # 进行四个模块的交互
+                module_features = [x_att_s, x_att_t_tmp, x_graph_s, x_graph_t_tmp]
+                [x_att_s, x_att_t_tmp, x_graph_s, x_graph_t_tmp] = self.module_interaction(module_features)
+            
+            # 进行时间维度处理
+            x_att_t = self.att_temporal(x_att_s)
+            x_graph_t = self.graph_temporal(x_graph_s)
+            
+            x_attn = x_att_t
+            x_graph = x_graph_t
+
+            # 自适应融合或简单平均
+            if self.use_adaptive_fusion:
+                alpha = torch.cat((x_attn, x_graph), dim=-1)
+                alpha = self.fusion(alpha)
+                alpha = alpha.softmax(dim=-1)
+                x = x_attn * alpha[..., 0:1] + x_graph * alpha[..., 1:2]
+            else:
+                x = (x_attn + x_graph) * 0.5
 
         return x
 
@@ -163,7 +285,8 @@ class MotionAGFormerBlock(nn.Module):
 def create_layers(dim, n_layers, mlp_ratio=4., act_layer=nn.GELU, attn_drop=0., drop_rate=0., drop_path_rate=0.,
                   num_heads=8, use_layer_scale=True, qkv_bias=False, qkv_scale=None, layer_scale_init_value=1e-5,
                   use_adaptive_fusion=True, hierarchical=False, use_temporal_similarity=True,
-                  temporal_connection_len=1, use_tcn=False, graph_only=False, neighbour_num=4, n_frames=243):
+                  temporal_connection_len=1, use_tcn=False, graph_only=False, neighbour_num=4, n_frames=243,
+                  enable_module_interaction=True):
     """
     generates MotionAGFormer layers
     """
@@ -187,7 +310,8 @@ def create_layers(dim, n_layers, mlp_ratio=4., act_layer=nn.GELU, attn_drop=0., 
                                           use_tcn=use_tcn,
                                           graph_only=graph_only,
                                           neighbour_num=neighbour_num,
-                                          n_frames=n_frames))
+                                          n_frames=n_frames,
+                                          enable_module_interaction=enable_module_interaction))
     layers = nn.Sequential(*layers)
 
     return layers
@@ -202,7 +326,7 @@ class MotionAGFormer(nn.Module):
                  drop=0., drop_path=0., use_layer_scale=True, layer_scale_init_value=1e-5, use_adaptive_fusion=True,
                  num_heads=4, qkv_bias=False, qkv_scale=None, hierarchical=False, num_joints=17,
                  use_temporal_similarity=True, temporal_connection_len=1, use_tcn=False, graph_only=False,
-                 neighbour_num=4, n_frames=243):
+                 neighbour_num=4, n_frames=243,enable_module_interaction=True):
         """
         :param n_layers: Number of layers.
         :param dim_in: Input dimension.
@@ -228,6 +352,7 @@ class MotionAGFormer(nn.Module):
         :param graph_only: Uses GCN instead of GraphFormer in the graph branch.
         :param neighbour_num: Number of neighbors for temporal GCN similarity.
         :param n_frames: Number of frames. Default is 243
+        :param enable_module_interaction: Whether to enable interaction between modules before fusion
         """
         super().__init__()
 
@@ -254,7 +379,8 @@ class MotionAGFormer(nn.Module):
                                     use_tcn=use_tcn,
                                     graph_only=graph_only,
                                     neighbour_num=neighbour_num,
-                                    n_frames=n_frames)
+                                    n_frames=n_frames,
+                                    enable_module_interaction=enable_module_interaction)
 
         self.rep_logit = nn.Sequential(OrderedDict([
             ('fc', nn.Linear(dim_feat, dim_rep)),
